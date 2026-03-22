@@ -38,6 +38,18 @@ from contextlib import contextmanager
 from datetime import datetime
 import warnings
 import math
+try:
+    from .derived_metrics import (
+        normalize_accuracy_for_derived_metrics,
+        compute_collapse_loss,
+        add_collapse_loss_to_condition_summary,
+    )
+except ImportError:
+    from derived_metrics import (
+        normalize_accuracy_for_derived_metrics,
+        compute_collapse_loss,
+        add_collapse_loss_to_condition_summary,
+    )
 
 warnings.filterwarnings('ignore')
 
@@ -1282,6 +1294,8 @@ def aggregate_results(
         'n_samples': n,
         'accuracy': np.mean(accuracies) if accuracies else None,
         'accuracy_std': np.std(accuracies) if accuracies else None,
+        # Derived later once probe AUROC is attached to the condition summary.
+        'collapse_loss': None,
         'entropy_mean': float(np.nanmean(entropies)),
         'entropy_std': float(np.nanstd(entropies)),
         'entropy_valid_n': entropy_valid_n,
@@ -1348,6 +1362,8 @@ def save_experiment_results(
         
         if condition in probe_results:
             summary['conditions'][condition]['probe'] = asdict(probe_results[condition])
+
+        add_collapse_loss_to_condition_summary(summary['conditions'][condition])
     
     # Add detailed results
     summary['detailed_results'] = {
@@ -1379,7 +1395,14 @@ def load_experiment_results(model_family: str, benchmark: str, drive_path: str) 
     """Load experiment results from JSON."""
     json_path = os.path.join(drive_path, f"{model_family}_{benchmark}_results.json")
     with open(json_path, 'r') as f:
-        return json.load(f)
+        data = json.load(f)
+
+    # Backfill derived metrics for older results that predate collapse_loss.
+    for condition_summary in data.get('conditions', {}).values():
+        if isinstance(condition_summary, dict) and 'collapse_loss' not in condition_summary:
+            add_collapse_loss_to_condition_summary(condition_summary)
+
+    return data
 
 
 def list_available_results(drive_path: str) -> List[Tuple[str, str]]:
