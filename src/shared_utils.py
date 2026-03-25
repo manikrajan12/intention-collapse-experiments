@@ -32,7 +32,7 @@ import re
 import random
 import json
 import os
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Union
 from dataclasses import dataclass, asdict, field
 from contextlib import contextmanager
 from datetime import datetime
@@ -44,12 +44,14 @@ try:
         compute_collapse_loss,
         add_collapse_loss_to_condition_summary,
     )
+    from metrics.rcg import compute_rcg_full
 except ImportError:
     from derived_metrics import (
         normalize_accuracy_for_derived_metrics,
         compute_collapse_loss,
         add_collapse_loss_to_condition_summary,
     )
+    from metrics.rcg import compute_rcg_full
 
 warnings.filterwarnings('ignore')
 
@@ -146,6 +148,10 @@ class ExperimentResult:
     extraction_rule_used: str = ""
     math_parse_failed: bool = False
     stopped_by_criteria: bool = False
+    # Reasoning Consistency Gain diagnostics
+    rcg: Optional[float] = None
+    rcg_trajectory: Optional[List[float]] = None
+    rcg_num_steps: int = 0
     
     def to_dict(self) -> Dict:
         d = asdict(self)
@@ -687,8 +693,9 @@ def train_recoverability_probe(
     activations: np.ndarray,
     labels: np.ndarray,
     cv_folds: int = 5,
-    n_bootstrap: int = 1000
-) -> ProbeResults:
+    n_bootstrap: int = 1000,
+    return_model: bool = False
+) -> Union[ProbeResults, Tuple[ProbeResults, Pipeline]]:
     """
     Train a linear probe to measure latent recoverability Recov(I; Z).
     
@@ -702,7 +709,8 @@ def train_recoverability_probe(
         n_bootstrap: Number of bootstrap samples for CI
     
     Returns:
-        ProbeResults dataclass with all metrics
+        ProbeResults dataclass with all metrics.
+        If return_model=True, also returns the fitted sklearn Pipeline.
     """
     # Flatten activations
     if activations.ndim == 3:
@@ -719,21 +727,23 @@ def train_recoverability_probe(
     pos_rate = counts[1] / n_samples if len(unique) == 2 else 0.0
     
     if len(unique) < 2:
-        return ProbeResults(
+        results = ProbeResults(
             auroc=0.5, auroc_ci_low=0.0, auroc_ci_high=1.0,
             accuracy=0.5, balanced_acc=0.5, brier=1.0,
             n_samples=n_samples, pos_rate=pos_rate, cv_folds_used=0, n_bootstrap=0
         )
+        return (results, None) if return_model else results
     
     min_class_count = counts.min()
     cv_folds = min(cv_folds, min_class_count)
     
     if cv_folds < 2:
-        return ProbeResults(
+        results = ProbeResults(
             auroc=0.5, auroc_ci_low=0.0, auroc_ci_high=1.0,
             accuracy=0.5, balanced_acc=0.5, brier=1.0,
             n_samples=n_samples, pos_rate=pos_rate, cv_folds_used=0, n_bootstrap=0
         )
+        return (results, None) if return_model else results
     
     # Pipeline with scaler INSIDE (no leakage)
     pipeline = Pipeline([
@@ -789,7 +799,9 @@ def train_recoverability_probe(
     else:
         ci_low, ci_high = 0.0, 1.0
     
-    return ProbeResults(
+    pipeline.fit(activations, labels)
+
+    results = ProbeResults(
         auroc=auroc_overall,
         auroc_ci_low=max(0, ci_low),
         auroc_ci_high=min(1, ci_high),
@@ -801,6 +813,107 @@ def train_recoverability_probe(
         cv_folds_used=cv_folds,
         n_bootstrap=n_bootstrap
     )
+    return (results, pipeline) if return_model else results
+
+
+def _set_result_field(result: Union[ExperimentResult, Dict[str, Any]], field_name: str, value: Any) -> None:
+    """Set a result field on either a dataclass instance or a dict."""
+    if isinstance(result, dict):
+        result[field_name] = value
+    else:
+        setattr(result, field_name, value)
+
+
+def _get_result_field(result: Union[ExperimentResult, Dict[str, Any]], field_name: str, default: Any = None) -> Any:
+    """Read a result field from either a dataclass instance or a dict."""
+    if isinstance(result, dict):
+        return result.get(field_name, default)
+    return getattr(result, field_name, default)
+
+
+def _truncate_trajectory(trajectory: List[float], max_points: Optional[int]) -> List[float]:
+    """Optionally truncate stored trajectories for compact JSON output."""
+    if max_points is None or max_points <= 0 or len(trajectory) <= max_points:
+        return trajectory
+    return trajectory[:max_points]
+
+
+def attach_rcg_to_results(
+    results: List[Union[ExperimentResult, Dict[str, Any]]],
+    activation_arrays: List[np.ndarray],
+    activation_idxs: Optional[List[int]],
+    probe_model: Any,
+    step_size: int = 20,
+    trajectory_max_points: Optional[int] = 50,
+    debug_examples: int = 3
+) -> Dict[str, Any]:
+    """
+    Compute and attach Reasoning Consistency Gain (RCG) to example results.
+
+    RCG measures whether a probe's score for eventual correctness tends to
+    increase over the course of generation. This helper aligns saved per-token
+    activations to example results by checkpoint/problem index, reuses an
+    already-trained probe model, and returns condition-level summary stats.
+    """
+    if probe_model is None or not activation_arrays:
+        return {}
+
+    if activation_idxs is None:
+        activation_idxs = list(range(len(activation_arrays)))
+
+    idx_to_payload: Dict[int, Dict[str, Any]] = {}
+    debug_payloads: List[Tuple[int, Dict[str, Any]]] = []
+
+    for hidden_states, idx in zip(activation_arrays, activation_idxs):
+        try:
+            payload = compute_rcg_full(hidden_states, probe_model, step_size=step_size)
+        except Exception:
+            continue
+        idx_to_payload[int(idx)] = payload
+        if len(debug_payloads) < debug_examples:
+            debug_payloads.append((int(idx), payload))
+
+    rcg_values: List[float] = []
+    for result in results:
+        result_idx = _get_result_field(result, '_checkpoint_idx')
+        if result_idx is None:
+            result_idx = _get_result_field(result, 'problem_idx')
+        if result_idx is None:
+            continue
+
+        payload = idx_to_payload.get(int(result_idx))
+        if payload is None:
+            continue
+
+        rcg_values.append(float(payload['rcg']))
+        _set_result_field(result, 'rcg', float(payload['rcg']))
+        _set_result_field(
+            result,
+            'rcg_trajectory',
+            _truncate_trajectory(list(payload['trajectory']), trajectory_max_points)
+        )
+        _set_result_field(result, 'rcg_num_steps', int(payload['num_steps']))
+
+    if not rcg_values:
+        return {}
+
+    rcg_array = np.asarray(rcg_values, dtype=float)
+    summary = {
+        'rcg_mean': float(np.mean(rcg_array)),
+        'rcg_std': float(np.std(rcg_array)),
+        'rcg_positive_rate': float(np.mean(rcg_array > 0)),
+        'rcg_negative_rate': float(np.mean(rcg_array < 0)),
+        'rcg_n': int(len(rcg_array)),
+    }
+
+    print(
+        f"  RCG: mean={summary['rcg_mean']:.4f}, std={summary['rcg_std']:.4f}, "
+        f"positive={summary['rcg_positive_rate']:.1%}, negative={summary['rcg_negative_rate']:.1%}"
+    )
+    for idx, payload in debug_payloads:
+        print(f"    idx={idx} trajectory={payload['trajectory'][:min(8, len(payload['trajectory']))]}")
+
+    return summary
 
 
 # =============================================================================
@@ -1264,6 +1377,7 @@ def aggregate_results(
     accuracies = [r.is_correct for r in results if r.condition != 'babble']
     entropies = np.array([r.metrics.entropy for r in results])
     gen_tokens = [r.generated_tokens for r in results]
+    rcg_values = [float(r.rcg) for r in results if r.rcg is not None]
     
     # Count valid/invalid entropies
     entropy_valid_mask = ~np.isnan(entropies) & ~np.isinf(entropies)
@@ -1308,6 +1422,13 @@ def aggregate_results(
         'generated_tokens_std': float(np.std(gen_tokens)),
         'stopped_by_criteria_rate': np.mean([r.stopped_by_criteria for r in results]),
     }
+
+    if rcg_values:
+        rcg_array = np.asarray(rcg_values, dtype=float)
+        agg['rcg_mean'] = float(np.mean(rcg_array))
+        agg['rcg_std'] = float(np.std(rcg_array))
+        agg['rcg_positive_rate'] = float(np.mean(rcg_array > 0))
+        agg['rcg_negative_rate'] = float(np.mean(rcg_array < 0))
     
     # MATH-specific
     if results[0].benchmark == 'math':

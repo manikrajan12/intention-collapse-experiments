@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 setup(
     name="intention-collapse",
     version="2.0.0",
-    packages=find_packages(include=["src", "src.*"]),
+    packages=find_packages(include=["src", "src.*", "metrics", "metrics.*"]),
     package_dir={"src": "src"},
     python_requires=">=3.10",
     install_requires=[

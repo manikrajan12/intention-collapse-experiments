@@ -32,7 +32,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
+include = ["src*", "metrics*"]
 namespaces = false
 
 [tool.setuptools.package-data]
