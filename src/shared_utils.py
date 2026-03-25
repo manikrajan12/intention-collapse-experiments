@@ -38,20 +38,31 @@ from contextlib import contextmanager
 from datetime import datetime
 import warnings
 import math
+import importlib.util
+from pathlib import Path
 try:
     from .derived_metrics import (
         normalize_accuracy_for_derived_metrics,
         compute_collapse_loss,
         add_collapse_loss_to_condition_summary,
     )
-    from metrics.rcg import compute_rcg_full
+    from .rcg import compute_rcg_full
 except ImportError:
     from derived_metrics import (
         normalize_accuracy_for_derived_metrics,
         compute_collapse_loss,
         add_collapse_loss_to_condition_summary,
     )
-    from metrics.rcg import compute_rcg_full
+    try:
+        from rcg import compute_rcg_full
+    except ImportError:
+        _rcg_path = Path(__file__).resolve().parent.parent / "metrics" / "rcg.py"
+        _rcg_spec = importlib.util.spec_from_file_location("intention_collapse_rcg", _rcg_path)
+        if _rcg_spec is None or _rcg_spec.loader is None:
+            raise
+        _rcg_module = importlib.util.module_from_spec(_rcg_spec)
+        _rcg_spec.loader.exec_module(_rcg_module)
+        compute_rcg_full = _rcg_module.compute_rcg_full
 
 warnings.filterwarnings('ignore')
 
