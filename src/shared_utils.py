@@ -575,6 +575,98 @@ class ActivationExtractor:
         return np.stack(all_activations, axis=0)
 
 
+def _extract_selected_layer_activations(
+    hidden_states: Tuple[torch.Tensor, ...],
+    layers: List[int]
+) -> np.ndarray:
+    """
+    Extract selected layer activations from model hidden_states output.
+
+    hidden_states includes the embedding output at index 0, so transformer
+    layer `l` lives at hidden_states[l + 1].
+    """
+    selected = []
+    for layer_idx in layers:
+        hs = hidden_states[layer_idx + 1][:, -1, :].detach().cpu().float().numpy()
+        selected.append(hs.squeeze(0))
+    return np.stack(selected, axis=0)
+
+
+def _flatten_layer_activations(layer_activations: np.ndarray) -> np.ndarray:
+    """Flatten [n_layers, hidden_dim] to a probe-compatible feature vector."""
+    return layer_activations.reshape(-1).astype(np.float32, copy=False)
+
+
+def _greedy_generate_with_activation_trajectory(
+    model,
+    tokenizer,
+    prompt_inputs,
+    layers: List[int],
+    max_new_tokens: int,
+    stopping_criteria: Optional[StoppingCriteriaList],
+    stopper: Optional[StopOnPattern],
+) -> Tuple[torch.Tensor, np.ndarray]:
+    """
+    Greedy generation loop that records one flattened activation vector per token.
+
+    The recorded trajectory has shape [num_generated_tokens, n_layers * hidden_dim],
+    which matches the flattened representation used by the recoverability probe.
+    """
+    generated = prompt_inputs["input_ids"]
+    attention_mask = prompt_inputs["attention_mask"]
+    past_key_values = None
+    trajectory: List[np.ndarray] = []
+
+    if stopper is not None:
+        stopper.reset()
+
+    for _ in range(max_new_tokens):
+        model_inputs = {
+            "attention_mask": attention_mask,
+            "use_cache": True,
+            "output_hidden_states": True,
+            "return_dict": True,
+        }
+        if past_key_values is None:
+            model_inputs["input_ids"] = generated
+        else:
+            model_inputs["input_ids"] = generated[:, -1:]
+            model_inputs["past_key_values"] = past_key_values
+
+        outputs = model(**model_inputs)
+        past_key_values = outputs.past_key_values
+
+        layer_activations = _extract_selected_layer_activations(outputs.hidden_states, layers)
+        trajectory.append(_flatten_layer_activations(layer_activations))
+
+        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_token], dim=1)
+        attention_mask = torch.cat(
+            [
+                attention_mask,
+                torch.ones(
+                    (attention_mask.shape[0], 1),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device
+                ),
+            ],
+            dim=1,
+        )
+
+        should_stop = False
+        if stopper is not None and stopping_criteria is not None:
+            should_stop = bool(stopping_criteria(generated, outputs.logits[:, -1, :]))
+        if next_token.item() == tokenizer.eos_token_id or should_stop:
+            break
+
+    if trajectory:
+        trajectory_array = np.stack(trajectory, axis=0)
+    else:
+        trajectory_array = np.empty((0, 0), dtype=np.float32)
+
+    return generated, trajectory_array
+
+
 # =============================================================================
 # INTENTION METRICS
 # =============================================================================
@@ -1270,7 +1362,7 @@ def run_single_problem(
     condition: str,
     max_new_tokens: int,
     entropy_top_k: int = 100
-) -> Tuple[ExperimentResult, Optional[np.ndarray]]:
+) -> Tuple[ExperimentResult, Optional[Dict[str, np.ndarray]]]:
     """
     Run model on single problem using 2-pass approach.
     
@@ -1287,16 +1379,16 @@ def run_single_problem(
     # PASS 1: Forward pass on prompt → pre-collapse intention state
     # =========================================================================
     activations = None
+    trajectory_activations = None
     entropy = 0.0
     argmax_token_id = -1
     
     with torch.no_grad():
-        with extractor.capture():
-            outputs_forward = model(**inputs)
-        
+        outputs_forward = model(**inputs, output_hidden_states=True, return_dict=True)
+
         try:
-            activations = extractor.get_activations()
-        except Exception as e:
+            activations = _extract_selected_layer_activations(outputs_forward.hidden_states, extractor.layers)
+        except Exception:
             activations = None
         
         # Compute intention entropy from logits of NEXT token
@@ -1309,14 +1401,14 @@ def run_single_problem(
     stopping_criteria, stopper = get_stopping_criteria(tokenizer, problem.benchmark, condition)
     
     with torch.no_grad():
-        generated = model.generate(
-            **inputs,
+        generated, trajectory_activations = _greedy_generate_with_activation_trajectory(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_inputs=inputs,
+            layers=extractor.layers,
             max_new_tokens=max_new_tokens,
-            temperature=None,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-            stopping_criteria=stopping_criteria
-            # NOTE: NO output_scores=True, NO return_dict_in_generate=True
+            stopping_criteria=stopping_criteria,
+            stopper=stopper,
         )
     
     generated_ids = generated[0][input_length:]
@@ -1363,7 +1455,14 @@ def run_single_problem(
         stopped_by_criteria=stopped_by_criteria
     )
     
-    return result, activations
+    activation_payload = None
+    if activations is not None or trajectory_activations is not None:
+        activation_payload = {
+            'prompt_activations': activations,
+            'trajectory_activations': trajectory_activations,
+        }
+    
+    return result, activation_payload
 
 
 # =============================================================================

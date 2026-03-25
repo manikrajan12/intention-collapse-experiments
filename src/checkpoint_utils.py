@@ -222,6 +222,7 @@ class ExperimentRunner:
         self._writer: Optional[JSONLWriter] = None
         self._error_writer: Optional[JSONLWriter] = None
         self._activations: List[np.ndarray] = []
+        self._rcg_activations: List[np.ndarray] = []
         self._activation_idxs: List[int] = []  # Track which idx each activation belongs to
         self._start_time: float = 0
         self._total_items: int = 0
@@ -302,7 +303,7 @@ class ExperimentRunner:
             return [], []
         
         try:
-            data = np.load(str(self.activations_path))
+            data = np.load(str(self.activations_path), allow_pickle=True)
             activations = []
             idxs = []
             
@@ -358,7 +359,7 @@ class ExperimentRunner:
             if self.activations_path.exists():
                 # Count existing activations for info only
                 try:
-                    data = np.load(str(self.activations_path))
+                    data = np.load(str(self.activations_path), allow_pickle=True)
                     n_existing = len(data['activations']) if 'activations' in data else 0
                     print(f"  Activations file exists ({n_existing} items, will append on save)")
                 except:
@@ -415,7 +416,7 @@ class ExperimentRunner:
             
             yield item
     
-    def save_item(self, result: Any, activations: Optional[np.ndarray] = None):
+    def save_item(self, result: Any, activations: Optional[Any] = None):
         """
         Save a single result item.
         
@@ -438,10 +439,19 @@ class ExperimentRunner:
         # Write to JSONL (immediately flushed)
         self._writer.write(result_dict)
         
-        # Store activations with their index for alignment (Fix #3)
+        # Store activations with their index for alignment.
         if activations is not None:
-            self._activations.append(activations)
-            self._activation_idxs.append(self._current_idx)
+            if isinstance(activations, dict):
+                prompt_acts = activations.get('prompt_activations')
+                rcg_acts = activations.get('trajectory_activations')
+                if prompt_acts is not None:
+                    self._activations.append(prompt_acts)
+                    self._activation_idxs.append(self._current_idx)
+                if rcg_acts is not None:
+                    self._rcg_activations.append(rcg_acts)
+            else:
+                self._activations.append(activations)
+                self._activation_idxs.append(self._current_idx)
         
         # Update counts
         self._completed += 1
@@ -526,18 +536,23 @@ class ExperimentRunner:
         For very large runs, consider chunked saving to separate files.
         """
         if not self._activations:
-            return
+            if not self._rcg_activations:
+                return
         
         try:
             # Load existing activations and idxs if any
             existing_acts = []
+            existing_rcg_acts = []
             existing_idxs = []
             if self.activations_path.exists():
                 try:
-                    data = np.load(str(self.activations_path))
+                    data = np.load(str(self.activations_path), allow_pickle=True)
                     if 'activations' in data:
                         acts_array = data['activations']
                         existing_acts = [acts_array[i] for i in range(acts_array.shape[0])]
+                    if 'rcg_activations' in data:
+                        rcg_array = data['rcg_activations']
+                        existing_rcg_acts = [rcg_array[i] for i in range(len(rcg_array))]
                     if 'idxs' in data:
                         existing_idxs = data['idxs'].tolist()
                     else:
@@ -547,22 +562,28 @@ class ExperimentRunner:
             
             # Combine existing + new
             all_activations = existing_acts + self._activations
+            all_rcg_activations = existing_rcg_acts + self._rcg_activations
             all_idxs = existing_idxs + self._activation_idxs
             
-            if all_activations:
-                acts_array = np.stack(all_activations, axis=0)
+            if all_activations or all_rcg_activations:
                 idxs_array = np.array(all_idxs, dtype=np.int32)
+                save_payload = {'idxs': idxs_array}
+
+                if all_activations:
+                    save_payload['activations'] = np.stack(all_activations, axis=0)
+                if all_rcg_activations:
+                    save_payload['rcg_activations'] = np.array(all_rcg_activations, dtype=object)
                 
                 # Save both activations and their indices (Fix #3)
                 np.savez_compressed(
                     str(self.activations_path),
-                    activations=acts_array,
-                    idxs=idxs_array
+                    **save_payload
                 )
                 
                 # Clear only NEW activations/idxs (keep memory reasonable)
                 # Next save will reload from file + append new
                 self._activations.clear()
+                self._rcg_activations.clear()
                 self._activation_idxs.clear()
                 
         except Exception as e:
